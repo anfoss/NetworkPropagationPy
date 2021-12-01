@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import os
 from mypy import biostat
+import gseapy as gp
 
 
 def format_string(ppi_path, info_path=None, k=600, outpath=None):
@@ -51,12 +52,10 @@ def gen_s_matrix(G, outpath, pr=0.3, nm="string_human"):
     Returns:
         print s_matrix and nodenames to a file
     """
-    if os.path.isfile("{}_largest_component.graphml".format(nm)):
-        G = nx.read_graphml("{}_largest_component.graphml".format(nm))
-    else:
-        largest_cc = max(nx.connected_components(G), key=len)
-        G = G.subgraph(largest_cc)
-        nx.write_graphml(G, path="{}_largest_component".format(nm))
+
+    largest_cc = max(nx.connected_components(G), key=len)
+    G = G.subgraph(largest_cc)
+    nx.write_graphml(G, path="{}_largest_component".format(nm))
     # Calculate matrix inputs
     nodes = G.nodes()
     A = nx.adjacency_matrix(G, nodelist=nodes)
@@ -76,13 +75,13 @@ def gen_s_matrix(G, outpath, pr=0.3, nm="string_human"):
     I = np.identity(W.shape[0])
 
     s_matrix = pr * np.linalg.inv(I - (1 - pr) * W)
-    print(np.max(s_matrix), np.min(s_matrix))
+    # print(np.max(s_matrix), np.min(s_matrix))
     np.save("{}pr{}f.npy".format(outpath, pr), s_matrix)
-    print(s_matrix.shape)
+    # print(s_matrix.shape)
     # node names
     nodes_network = pd.DataFrame(nodes)  # Getting node names(gene names)
     nodes_network.rename(columns={0: "gene_name"}, inplace=True)
-    print(nodes_network.shape)
+    # print(nodes_network.shape)
     nodes_network.to_csv("{}pr{}f.csv".format(outpath, pr), index=False)
     return s_matrix, nodes_network
 
@@ -112,6 +111,7 @@ def propagate_s_matrix(
         geneheats = geneheats.groupby("Genes").max().reset_index()
     # add heats to column in gene names only if present
     init_heat = geneheats[geneheats["Genes"].isin(s_matrix_names["gene_name"])]
+    print(init_heat.shape)
     # now add all the rest of the names with 0 heat
     init_heat = pd.merge(
         init_heat, s_matrix_names, left_on="Genes", right_on="gene_name", how="outer"
@@ -124,7 +124,8 @@ def propagate_s_matrix(
     prop_heat = np.matmul(s_matrix, init_heat.values)
 
     # sanity check
-    if abs(np.sum(prop_heat) - np.sum(init_heat.values)) > 0.001:
+    if np.abs(np.sum(prop_heat) - np.sum(init_heat.values)) > 0.001:
+        print(np.abs(np.sum(prop_heat) - np.sum(init_heat.values)))
         raise ValueError("wrong diff heat")
 
     maxheat = prop_heat.flatten()
@@ -223,17 +224,25 @@ def mag_score(log2fc, pvalue, magscale=2):
 
 
 def main():
-    ppi = format_string(ppi_path='meta/string_human.txt',
-                        info_path='meta/info_human.txt',
-                        k=600,
-                        outpath=None)
-    #s_matrix, s_matrix_names = gen_s_matrix(ppi, outpath='meta/s_matrix_human', pr=0.5)
-    s_matrix = np.load("meta/s_matrix_humanpr0.3f.npy")
-    s_matrix_names = pd.read_csv("meta/s_matrix_humanpr0.3f.csv")
+    # ppi = format_string(ppi_path='meta/string_human.txt',
+    #                     info_path='meta/info_human.txt',
+    #                     k=600,
+    #                     outpath=None)
+    ppi = pd.read_csv('meta/PathwayCommons12.All.hgnc.txt', sep='\t')
+    ppi = ppi[~ppi['INTERACTION_TYPE'].str.contains('Reference')]
+    ppi = ppi[~ppi['INTERACTION_TYPE'].str.contains('PARTICIPANT_TYPE')]
+    ppi = nx.from_pandas_edgelist(ppi, source='PARTICIPANT_A', target='PARTICIPANT_B')
+    ppi.remove_edges_from(nx.selfloop_edges(ppi))
+    matr_nm = 's_matrix_human_pathwaycommon'
+    pr = 0.2
+    #s_matrix, s_matrix_names = gen_s_matrix(ppi, outpath='meta/{}'.format(matr_nm), pr=pr)
+    print('{} generated'.format(matr_nm))
+    s_matrix = np.load("meta/{}pr{}f.npy".format(matr_nm, str(pr)))
+    s_matrix_names = pd.read_csv("meta/{}pr{}f.csv".format(matr_nm, str(pr)))
     data = pd.read_csv("malaria_stats_data.csv")
     data = data[data["p"] > 0]
     data["heat"] = mag_score(data["FC_HMT_LMT"].values, data["p"].values)
-    day = 0
+    day = 7
     data_heat = data[data["Day"] == day]
     data_heat = data_heat[["Genes", "heat"]]
     results, contrb = propagate_s_matrix(
@@ -244,9 +253,11 @@ def main():
         net_heat_only=True,
         permute_only_obs=False,
     )
-    results.to_csv("results_netprop{}Day.csv".format(str(day)))
-    signf_net = ppi.subgraph(results[results['q']<=0.05]['gene_name'].values)
-    nx.write_graphml(ppi, path='signif_net_{}Day.graphml'.format(str(day)))
+    results['entity'] = ['Small molecule' if x.startswith('CHEBI') else 'Protein' for x in results['gene_name']]
+    results.to_csv("results_netprop{}Day{}.csv".format(str(day),matr_nm))
+    signf_net = ppi.subgraph(results[results['p']<=0.05]['gene_name'].values)
+    nx.write_graphml(signf_net,
+                     path='signif_net_{}Day{}.graphml'.format(str(day), matr_nm))
 
 
 
