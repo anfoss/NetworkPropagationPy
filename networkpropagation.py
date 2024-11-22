@@ -2,18 +2,73 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import os
-from mypy import biostat
-import gseapy as gp
+import time
 
 
-def format_string(ppi_path, info_path=None, k=600, outpath=None):
+def timeit(method):
+    def timed(*args, **kw):
+        ts = time.time()
+        result = method(*args, **kw)
+        te = time.time()
+        if "log_time" in kw:
+            name = kw.get("log_name", method.__name__.upper())
+            kw["log_time"][name] = int((te - ts) * 1000)
+        else:
+            print("%r  %2.2f ms" % (method.__name__, (te - ts) * 1000))
+        return result
+
+    return timed
+
+
+
+def multiple_testing_correction(pvalues, correction_type="FDR"):
+    """
+    Consistent with R - print
+    correct_pvalues_for_multiple_testing([0.0, 0.01, 0.029, 0.03, 0.031, 0.05,
+     0.069, 0.07, 0.071, 0.09, 0.1])
+    """
+    from numpy import array, empty
+
+    #pvalues = array(pvalues)
+    sample_size = pvalues.shape[0]
+    qvalues = empty(sample_size)
+    if correction_type == "Bonferroni":
+        #  Bonferroni correction
+        qvalues = sample_size * pvalues
+    elif correction_type == "Bonferroni-Holm":
+        #  Bonferroni-Holm correction
+        values = [(pvalue, i) for i, pvalue in enumerate(pvalues)]
+        values.sort()
+        for rank, vals in enumerate(values):
+            pvalue, i = vals
+            qvalues[i] = (sample_size - rank) * pvalue
+    elif correction_type == "FDR":
+        #  Benjamini-Hochberg, AKA - FDR test
+        values = [(pvalue, i) for i, pvalue in enumerate(pvalues)]
+        values.sort()
+        values.reverse()
+        new_values = []
+        for i, vals in enumerate(values):
+            rank = sample_size - i
+            pvalue, index = vals
+            new_values.append((sample_size / rank) * pvalue)
+        for i in range(0, int(sample_size) - 1):
+            if new_values[i] < new_values[i + 1]:
+                new_values[i + 1] = new_values[i]
+        for i, vals in enumerate(values):
+            pvalue, index = vals
+            qvalues[index] = new_values[i]
+    return qvalues
+
+
+
+def format_string(ppi_path, info_path=None, k=800, outpath=None):
     """
     read string txt file and return networkX object with correct id (gn)
     Args:
         ppi_path: pathway to save network in graphml format
         info_path: name for mapping string id to gene names, not needed
         k: score to fiter interactions, default 600
-
     Returns:
         formatted ppi with gene name as node name
 
@@ -34,12 +89,13 @@ def format_string(ppi_path, info_path=None, k=600, outpath=None):
 def test_s_matrix(s_matrix):
     """
     test s_matrix for normality
+    s_matrix sum columns should be 1
     """
-    if np.allclose(np.sum(s_matrix, axis=1), atol=1e-03):
+    sm = np.sum(s_matrix, axis=0)
+    if np.allclose(sm, np.full(shape=sm.shape, fill_value=1, dtype=np.int64), atol=1e-03):
         pass
     else:
         raise ValueError("Smatrix has wrong column values")
-
 
 def gen_s_matrix(G, outpath, pr=0.3, nm="string_human"):
     """
@@ -51,6 +107,11 @@ def gen_s_matrix(G, outpath, pr=0.3, nm="string_human"):
         nm = name for the saved file
     Returns:
         print s_matrix and nodenames to a file
+    
+            
+    NOTE Order around %*% matters and S includes the pr factor !
+    col sums of S = 1
+    row sums of inv_denom = 1/pr 
     """
 
     largest_cc = max(nx.connected_components(G), key=len)
@@ -83,7 +144,9 @@ def gen_s_matrix(G, outpath, pr=0.3, nm="string_human"):
     nodes_network.rename(columns={0: "gene_name"}, inplace=True)
     # print(nodes_network.shape)
     nodes_network.to_csv("{}pr{}f.csv".format(outpath, pr), index=False)
+    test_s_matrix(s_matrix)
     return s_matrix, nodes_network
+
 
 
 def propagate_s_matrix(
@@ -102,32 +165,35 @@ def propagate_s_matrix(
         geneheats: pd dataframe with one value per gene
         nperm: number of permutations (int)
         net_heat_only: remove self heat for nodes present in geneheats
-        permute_only_obs: use only observation
+        permute_only_obs: use only observed genes
     Returns:
 
     """
-
     if geneheats.duplicated(subset=["Genes"]).any():
         geneheats = geneheats.groupby("Genes").max().reset_index()
+        
     # add heats to column in gene names only if present
     init_heat = geneheats[geneheats["Genes"].isin(s_matrix_names["gene_name"])]
-    print(init_heat.shape)
+    # lots of genes absent from s_matrix_names
+    
     # now add all the rest of the names with 0 heat
     init_heat = pd.merge(
         init_heat, s_matrix_names, left_on="Genes", right_on="gene_name", how="outer"
     ).drop("Genes", axis=1)
     init_heat.fillna(0, inplace=True)
     init_heat.set_index("gene_name", inplace=True)
+    ## not all names in geneheats are in s_matrix_names
+    
+    
     # essential to keep correct order
     init_heat = init_heat.reindex(index=s_matrix_names["gene_name"])
     # initial matrix multiplication
     prop_heat = np.matmul(s_matrix, init_heat.values)
-
     # sanity check
     if np.abs(np.sum(prop_heat) - np.sum(init_heat.values)) > 0.001:
+        print(np.sum(prop_heat), np.sum(init_heat.values))
         print(np.abs(np.sum(prop_heat) - np.sum(init_heat.values)))
         raise ValueError("wrong diff heat")
-
     maxheat = prop_heat.flatten()
     if net_heat_only:
         # remove self-heat
@@ -140,22 +206,22 @@ def propagate_s_matrix(
 
     # p value calc
     delta_heat = perm_heat - prop_heat
-
     # fract of positive values
     p_value = np.count_nonzero(delta_heat > 0, axis=1) / nperm
     results = pd.DataFrame(
         {
             "init_heat": init_heat.values.flatten(),
             "prop_heat": prop_heat.flatten(),
-            "p": p_value,
-            "q": biostat.multiple_testing_correction(p_value),
+            "p": p_value.flatten(),
+            'count': np.count_nonzero(delta_heat > 0, axis=1),
             "self_heat": init_heat.values.flatten() * np.diagonal(s_matrix).flatten(),
         },
         index=init_heat.index,
     ).reset_index()
+    results['q'] = multiple_testing_correction(results['p'].values, correction_type='FDR')
     signf_g = results[results["q"] <= 0.05]
     contrb = calc_contribution(s_matrix, init_heat, signf_g, net_heat_only)
-    results = results[results['q']>0]
+    #results = results[results['q']>0]
     return results, contrb
 
 
@@ -224,40 +290,45 @@ def mag_score(log2fc, pvalue, magscale=2):
 
 
 def main():
-    # ppi = format_string(ppi_path='meta/string_human.txt',
+    matr_nm = 's_matrix_human_string'
+
+    # G = format_string(ppi_path='meta/string_human.txt',
     #                     info_path='meta/info_human.txt',
     #                     k=600,
     #                     outpath=None)
-    ppi = pd.read_csv('meta/PathwayCommons12.All.hgnc.txt', sep='\t')
-    ppi = ppi[~ppi['INTERACTION_TYPE'].str.contains('Reference')]
-    ppi = ppi[~ppi['INTERACTION_TYPE'].str.contains('PARTICIPANT_TYPE')]
-    ppi = nx.from_pandas_edgelist(ppi, source='PARTICIPANT_A', target='PARTICIPANT_B')
-    ppi.remove_edges_from(nx.selfloop_edges(ppi))
-    matr_nm = 's_matrix_human_pathwaycommon'
+    
+    # ppi = pd.read_csv('meta/PathwayCommons12.All.hgnc.sif', sep='\t', header=None)
+    # ppi = nx.from_pandas_edgelist(ppi, source=0, target=2)    
+    # print(len(ppi.nodes))
+    # ppi.add_edges_from(G.edges())
+    # print(len(ppi.nodes))
+    # ppi.remove_edges_from(nx.selfloop_edges(ppi))
     pr = 0.2
-    #s_matrix, s_matrix_names = gen_s_matrix(ppi, outpath='meta/{}'.format(matr_nm), pr=pr)
-    print('{} generated'.format(matr_nm))
+    
+    # s_matrix, s_matrix_names = gen_s_matrix(ppi, outpath='meta/{}'.format(matr_nm), pr=pr)
     s_matrix = np.load("meta/{}pr{}f.npy".format(matr_nm, str(pr)))
     s_matrix_names = pd.read_csv("meta/{}pr{}f.csv".format(matr_nm, str(pr)))
-    data = pd.read_csv("malaria_stats_data.csv")
-    data = data[data["p"] > 0]
-    data["heat"] = mag_score(data["FC_HMT_LMT"].values, data["p"].values)
-    day = 7
-    data_heat = data[data["Day"] == day]
-    data_heat = data_heat[["Genes", "heat"]]
+    #data = gen_test_data(s_matrix_names)
+    data = pd.read_csv("regulated_genes.csv")
+    # data = data[['Log2FC', 'GN', 'q']]
+    # data.columns = ['Log2FC', 'GN', 'p']    
+    # data = data[data["p"] < 0.05]
+    data["heat"] = mag_score(data["logFC.TP_6h"].values, data["adj.P.Val.TP_6h"].values, magscale=0.5)
+    data = data[["gn", "heat"]]
+    data.columns = ['Genes', 'heat'] 
     results, contrb = propagate_s_matrix(
         s_matrix,
         s_matrix_names,
-        data_heat,
-        nperm=20000,
+        data,
+        nperm=50000,
         net_heat_only=True,
         permute_only_obs=False,
     )
-    results['entity'] = ['Small molecule' if x.startswith('CHEBI') else 'Protein' for x in results['gene_name']]
-    results.to_csv("results_netprop{}Day{}.csv".format(str(day),matr_nm))
-    signf_net = ppi.subgraph(results[results['p']<=0.05]['gene_name'].values)
-    nx.write_graphml(signf_net,
-                     path='signif_net_{}Day{}.graphml'.format(str(day), matr_nm))
+    #results['entity'] = ['Small molecule' if x.startswith('CHEBI') else 'Protein' for x in results['gene_name']]
+    results.to_csv("results_netprop_{}.csv".format(matr_nm))
+    # signf_net = ppi.subgraph(results[results['p']<=0.05]['gene_name'].values)
+    # nx.write_graphml(signf_net,
+    #                  path='signif_net_{}Day{}.graphml'.format(str(day), matr_nm))
 
 
 
